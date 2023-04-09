@@ -16,12 +16,13 @@ import (
 	"syscall"
 	"time"
 
+	retry "github.com/avast/retry-go/v4"
 	"github.com/gorilla/websocket"
 )
 
 var addr = flag.String("addr", "localhost:8080", "http service address")
 
-func execWebSock(ctx context.Context, addr string) error {
+func execWebSock(ctx context.Context, addr string, successFn func()) error {
 	u := url.URL{Scheme: "ws", Host: addr, Path: "/echo"}
 	log.Printf("connecting to %s", u.String())
 
@@ -36,6 +37,7 @@ func execWebSock(ctx context.Context, addr string) error {
 
 	go func() {
 		defer close(errCh)
+		isFirst := false
 		for {
 			_, message, err := c.ReadMessage()
 			if err != nil {
@@ -44,6 +46,10 @@ func execWebSock(ctx context.Context, addr string) error {
 				return
 			}
 			log.Printf("recv: %s", message)
+			if !isFirst {
+				successFn()
+				isFirst = true
+			}
 		}
 	}()
 
@@ -89,17 +95,46 @@ func main() {
 	ctx, cancel := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer cancel()
 
-	for {
-		err := execWebSock(ctx, *addr)
-		if err != nil {
-			log.Printf("execWebSock: %+v\n", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		time.Sleep(time.Second * 5)
-		log.Println("connect retry.")
-	}
+	retryCtx, retryCancel := context.WithCancel(ctx)
+	var maxConsecutiveErrorCount uint = 10
+	var retryCount uint
+	isFirst := true
+	var lastErr error
+	retry.Do(
+		func() error {
+			if retryCount > maxConsecutiveErrorCount {
+				log.Println("retry count error.")
+				return nil
+			}
+			err := execWebSock(ctx, *addr, func() {
+				retryCount = 0  // reset error count
+				isFirst = false // initial connect success
+			})
+			if err != nil {
+				log.Printf("execWebSock: %+v\n", err)
+				if isFirst {
+					retryCancel() // initial connect failed
+					isFirst = false
+				}
+			}
+			lastErr = err
+			return err
+		},
+		retry.Context(retryCtx),
+		retry.LastErrorOnly(true),
+		//retry.Attempts(maxConsecutiveErrorCount),
+		retry.Attempts(0), // infinity
+		retry.Delay(time.Millisecond*500),
+		retry.MaxDelay(time.Second*5),
+		//retry.OnRetry(func(n uint, err error) {
+		//	log.Printf("retry, num=%d\n", n)
+		//}),
+		retry.DelayType(func(_ uint, err error, config *retry.Config) time.Duration {
+			delayTime := retry.BackOffDelay(retryCount, err, config)
+			retryCount++
+			log.Printf("retry: num=%d, delay=%d\n", retryCount, delayTime/time.Second)
+			return delayTime
+		}),
+	)
+	log.Printf("err: %+v\n", lastErr)
 }

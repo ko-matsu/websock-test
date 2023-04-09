@@ -102,22 +102,23 @@ func main() {
 	var lastErr error
 	retry.Do(
 		func() error {
-			if retryCount > maxConsecutiveErrorCount {
-				log.Println("retry count error.")
-				return nil
-			}
 			err := execWebSock(ctx, *addr, func() {
 				retryCount = 0  // reset error count
 				isFirst = false // initial connect success
 			})
-			if err != nil {
-				log.Printf("execWebSock: %+v\n", err)
-				if isFirst {
-					retryCancel() // initial connect failed
-					isFirst = false
-				}
-			}
 			lastErr = err
+			switch {
+			case err == nil:
+			case retryCount == maxConsecutiveErrorCount:
+				log.Println("retry count error.")
+				return nil
+			case isFirst:
+				retryCancel() // initial connect failed
+				isFirst = false
+				fallthrough
+			default:
+				log.Printf("execWebSock: %+v\n", err)
+			}
 			return err
 		},
 		retry.Context(retryCtx),

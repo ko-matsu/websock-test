@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/url"
@@ -26,7 +27,7 @@ func execWebSock(ctx context.Context, addr string, successFn func()) error {
 	u := url.URL{Scheme: "ws", Host: addr, Path: "/echo"}
 	log.Printf("connecting to %s", u.String())
 
-	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	c, _, err := websocket.DefaultDialer.DialContext(ctx, u.String(), nil)
 	if err != nil {
 		log.Println("dial:", err)
 		return err
@@ -96,26 +97,26 @@ func main() {
 	defer cancel()
 
 	retryCtx, retryCancel := context.WithCancel(ctx)
+	defer retryCancel()
+
 	var maxConsecutiveErrorCount uint = 10
 	var retryCount uint
 	isFirst := true
-	var lastErr error
-	retry.Do(
+	err := retry.Do(
 		func() error {
 			err := execWebSock(ctx, *addr, func() {
 				retryCount = 0  // reset error count
 				isFirst = false // initial connect success
 			})
-			lastErr = err
 			switch {
 			case err == nil:
 			case retryCount == maxConsecutiveErrorCount:
 				log.Println("retry count error.")
-				return nil
+				return retry.Unrecoverable(err)
 			case isFirst:
-				retryCancel() // initial connect failed
 				isFirst = false
-				fallthrough
+				log.Printf("execWebSock: %+v\n", err)
+				err = retry.Unrecoverable(err)
 			default:
 				log.Printf("execWebSock: %+v\n", err)
 			}
@@ -127,15 +128,18 @@ func main() {
 		retry.Attempts(0), // infinity
 		retry.Delay(time.Millisecond*500),
 		retry.MaxDelay(time.Second*5),
-		//retry.OnRetry(func(n uint, err error) {
-		//	log.Printf("retry, num=%d\n", n)
-		//}),
+		retry.OnRetry(func(n uint, err error) {
+			log.Printf("retry, num=%d\n", n)
+			retryCount++
+		}),
 		retry.DelayType(func(_ uint, err error, config *retry.Config) time.Duration {
 			delayTime := retry.BackOffDelay(retryCount, err, config)
-			retryCount++
 			log.Printf("retry: num=%d, delay=%d\n", retryCount, delayTime/time.Second)
 			return delayTime
 		}),
 	)
-	log.Printf("err: %+v\n", lastErr)
+	if err != nil && !retry.IsRecoverable(err) {
+		err = errors.Unwrap(err)
+	}
+	log.Printf("err: %+v\n", err)
 }
